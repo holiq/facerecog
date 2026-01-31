@@ -6,7 +6,10 @@ from fastapi import HTTPException
 from fastapi import UploadFile
 
 def get_face_encoding(image: UploadFile):
+    image.file.seek(0)
     image_bytes = image.file.read()
+    image.file.seek(0)
+    
     pil_image = Image.open(io.BytesIO(image_bytes))
     pil_image = pil_image.convert("RGB")
     image_np = np.array(pil_image)
