@@ -1,9 +1,9 @@
-FROM python:3.13.2 AS builder
+FROM python:3.13.2-slim AS builder
 
 WORKDIR /app
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y cmake build-essential
+RUN apt-get update && apt-get install -y cmake build-essential git
 
 # Copy and install Python dependencies
 COPY requirements.txt .
@@ -32,14 +32,15 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY . .
 
 # Environment variables (can be overridden)
-ENV PORT=8000 \
-    HOST=0.0.0.0 \
-    WORKERS=1 \
+ENV WORKERS=1 \
     LOG_LEVEL=info \
     FACE_MATCH_THRESHOLD=0.6
 
-# Expose port (can be customized via PORT env var)
-EXPOSE $PORT
+# Expose application port
+EXPOSE 8000
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 # Start application
-CMD uvicorn main:app --host $HOST --port $PORT --workers $WORKERS --log-level $LOG_LEVEL
+ENTRYPOINT ["/entrypoint.sh"]

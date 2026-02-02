@@ -59,8 +59,7 @@ docker compose up --build
 
 | Variable               | Default           | Description                                               |
 | ---------------------- | ----------------- | --------------------------------------------------------- |
-| `PORT`                 | `8000`            | Server port                                               |
-| `HOST`                 | `0.0.0.0`         | Server host                                               |
+| `PORT`                 | `8000`            | Host port                                                 |
 | `WORKERS`              | `1`               | Number of uvicorn workers                                 |
 | `LOG_LEVEL`            | `info`            | Logging level (debug, info, warning, error)               |
 | `FACE_MATCH_THRESHOLD` | `0.6`             | Face recognition threshold (0.0-1.0, lower = more strict) |
@@ -72,9 +71,6 @@ docker compose up --build
 ```bash
 # MySQL
 DATABASE_URL=mysql+pymysql://username:password@hostname:3306/database_name
-
-# SQLite (for development only)
-DATABASE_URL=sqlite:///./facerecog.db
 ```
 
 ## 📚 API Documentation
