@@ -83,20 +83,12 @@ class FaceCache:
 face_cache = FaceCache()
 
 @app.get("/health")
-async def health_check(db: Session = Depends(get_db)):
-    """Health check endpoint"""
+async def health(db: Session = Depends(get_db)):
     try:
         db.execute(text("SELECT 1"))
-        db_status = "healthy"
-    except Exception as e:
-        db_status = f"unhealthy: {str(e)}"
-    
-    return {
-        "status": "ok",
-        "database": db_status,
-        "cache": face_cache.get_stats(),
-        "threshold": FACE_MATCH_THRESHOLD
-    }
+    except Exception:
+        raise HTTPException(status_code=503)
+    return Response(status_code=200)
 
 @app.post("/face-recognition/register")
 async def register_faces(images: list[UploadFile] = File(...), name: str = Form(...), db: Session = Depends(get_db)):
