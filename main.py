@@ -10,37 +10,247 @@ import os
 from dotenv import load_dotenv
 from typing import Optional
 from datetime import datetime
+import redis
+from abc import ABC, abstractmethod
 
 load_dotenv()
 
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+# Configuration
 FACE_MATCH_THRESHOLD = float(os.getenv('FACE_MATCH_THRESHOLD', '0.6'))
+CACHE_STRATEGY = os.getenv('CACHE_STRATEGY', 'memory')  # 'redis', 'memory', 'disabled'
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 
 app = FastAPI(title="Face Recognition API", version="1.0.0")
 
-class FaceCache:
+class BaseFaceCache(ABC):
+    @abstractmethod
+    def load_from_db(self, db: Session) -> dict:
+        """Load faces from database and return cache data"""
+        pass
+    
+    @abstractmethod
+    def get_cache_data(self) -> Optional[dict]:
+        """Get cached data if available"""
+        pass
+    
+    @abstractmethod
+    def invalidate(self):
+        """Invalidate cache"""
+        pass
+    
+    @abstractmethod
+    def get_stats(self) -> dict:
+        """Get cache statistics"""
+        pass
+
+class InMemoryFaceCache(BaseFaceCache):
     def __init__(self):
-        self.faces: Optional[list] = None
-        self.encodings_matrix: Optional[np.ndarray] = None
-        self.names_map: Optional[list] = None
+        self.cache_data: Optional[dict] = None
         self.last_updated: Optional[datetime] = None
     
-    def load_from_db(self, db: Session):
-        """Load semua faces dari database ke cache"""
-        logger.info("Loading faces from database to cache...")
+    def load_from_db(self, db: Session) -> dict:
+        logger.info("[MEMORY] Loading faces from database to cache...")
         faces = db.query(FaceEntity).all()
         
         if not faces:
-            self.faces = []
-            self.encodings_matrix = None
-            self.names_map = []
-            self.last_updated = datetime.now()
+            cache_data = {
+                "encodings_matrix": None,
+                "names_map": [],
+                "faces_count": 0
+            }
+        else:
+            all_encodings = []
+            names_map = []
+            
+            for face in faces:
+                descriptors = json.loads(face.descriptor)
+                for encoding in descriptors:
+                    all_encodings.append(encoding)
+                    names_map.append(face.name)
+            
+            cache_data = {
+                "encodings_matrix": np.array(all_encodings),
+                "names_map": names_map,
+                "faces_count": len(faces)
+            }
+        
+        self.cache_data = cache_data
+        self.last_updated = datetime.now()
+        logger.info(f"[MEMORY] Cache loaded: {cache_data['faces_count']} people, {len(cache_data['names_map'])} encodings")
+        return cache_data
+    
+    def get_cache_data(self) -> Optional[dict]:
+        return self.cache_data
+    
+    def invalidate(self):
+        self.cache_data = None
+        self.last_updated = None
+        logger.info("[MEMORY] Cache invalidated")
+    
+    def get_stats(self) -> dict:
+        if not self.cache_data:
+            return {"strategy": "memory", "cached": False}
+        return {
+            "strategy": "memory",
+            "cached": True,
+            "total_people": self.cache_data["faces_count"],
+            "total_encodings": len(self.cache_data["names_map"]),
+            "last_updated": self.last_updated.isoformat() if self.last_updated else None
+        }
+
+class RedisFaceCache(BaseFaceCache):
+    def __init__(self, redis_url: str):
+        self.redis_url = redis_url
+        self.redis_client = None
+        self.cache_key = "face_recognition:cache"
+        self._connect()
+    
+    def _connect(self):
+        try:
+            self.redis_client = redis.from_url(self.redis_url, decode_responses=False)
+            # Test connection
+            self.redis_client.ping()
+            logger.info(f"[REDIS] Connected to {self.redis_url}")
+        except Exception as e:
+            logger.error(f"[REDIS] Failed to connect: {e}")
+            self.redis_client = None
+    
+    def load_from_db(self, db: Session) -> dict:
+        if not self.redis_client:
+            logger.warning("[REDIS] Redis not available, loading fresh from DB")
+            return self._load_fresh_from_db(db)
+        
+        logger.info("[REDIS] Loading faces from database to Redis cache...")
+        faces = db.query(FaceEntity).all()
+        
+        if not faces:
+            cache_data = {
+                "encodings_matrix": None,
+                "names_map": [],
+                "faces_count": 0,
+                "last_updated": datetime.now().isoformat()
+            }
+        else:
+            all_encodings = []
+            names_map = []
+            
+            for face in faces:
+                descriptors = json.loads(face.descriptor)
+                for encoding in descriptors:
+                    all_encodings.append(encoding)
+                    names_map.append(face.name)
+            
+            cache_data = {
+                "encodings_list": all_encodings,  # Store as list for JSON serialization
+                "names_map": names_map,
+                "faces_count": len(faces),
+                "last_updated": datetime.now().isoformat()
+            }
+        
+        try:
+            # Store to Redis
+            self.redis_client.set(self.cache_key, json.dumps(cache_data), ex=3600)  # 1 hour TTL
+            logger.info(f"[REDIS] Cache stored: {cache_data['faces_count']} people, {len(cache_data['names_map'])} encodings")
+        except Exception as e:
+            logger.error(f"[REDIS] Failed to store cache: {e}")
+        
+        # Convert encodings_list to numpy array for return
+        if cache_data.get("encodings_list"):
+            cache_data["encodings_matrix"] = np.array(cache_data["encodings_list"])
+        else:
+            cache_data["encodings_matrix"] = None
+        if "encodings_list" in cache_data:
+            del cache_data["encodings_list"]
+        
+        return cache_data
+    
+    def _load_fresh_from_db(self, db: Session) -> dict:
+        """Fallback: load fresh from DB when Redis unavailable"""
+        faces = db.query(FaceEntity).all()
+        if not faces:
+            return {"encodings_matrix": None, "names_map": [], "faces_count": 0}
+        
+        all_encodings = []
+        names_map = []
+        for face in faces:
+            descriptors = json.loads(face.descriptor)
+            for encoding in descriptors:
+                all_encodings.append(encoding)
+                names_map.append(face.name)
+        
+        return {
+            "encodings_matrix": np.array(all_encodings),
+            "names_map": names_map,
+            "faces_count": len(faces)
+        }
+    
+    def get_cache_data(self) -> Optional[dict]:
+        if not self.redis_client:
+            return None
+        
+        try:
+            cached = self.redis_client.get(self.cache_key)
+            if not cached:
+                return None
+            
+            cache_data = json.loads(cached)
+            # Convert encodings_list back to numpy array
+            if cache_data.get("encodings_list"):
+                cache_data["encodings_matrix"] = np.array(cache_data["encodings_list"])
+                del cache_data["encodings_list"]
+            else:
+                cache_data["encodings_matrix"] = None
+            
+            return cache_data
+        except Exception as e:
+            logger.error(f"[REDIS] Failed to get cache: {e}")
+            return None
+    
+    def invalidate(self):
+        if not self.redis_client:
             return
+        
+        try:
+            self.redis_client.delete(self.cache_key)
+            logger.info("[REDIS] Cache invalidated")
+        except Exception as e:
+            logger.error(f"[REDIS] Failed to invalidate cache: {e}")
+    
+    def get_stats(self) -> dict:
+        if not self.redis_client:
+            return {"strategy": "redis", "cached": False, "redis_available": False}
+        
+        try:
+            cached = self.redis_client.get(self.cache_key)
+            if not cached:
+                return {"strategy": "redis", "cached": False, "redis_available": True}
+            
+            cache_data = json.loads(cached)
+            return {
+                "strategy": "redis",
+                "cached": True,
+                "redis_available": True,
+                "total_people": cache_data.get("faces_count", 0),
+                "total_encodings": len(cache_data.get("names_map", [])),
+                "last_updated": cache_data.get("last_updated")
+            }
+        except Exception as e:
+            return {"strategy": "redis", "cached": False, "redis_available": False, "error": str(e)}
+
+class NoCache(BaseFaceCache):
+    def load_from_db(self, db: Session) -> dict:
+        logger.info("[NO_CACHE] Loading faces directly from database...")
+        faces = db.query(FaceEntity).all()
+        
+        if not faces:
+            return {"encodings_matrix": None, "names_map": [], "faces_count": 0}
         
         all_encodings = []
         names_map = []
@@ -51,36 +261,39 @@ class FaceCache:
                 all_encodings.append(encoding)
                 names_map.append(face.name)
         
-        # Pre-convert ke numpy array untuk vectorized operations
-        self.encodings_matrix = np.array(all_encodings)
-        self.names_map = names_map
-        self.faces = faces
-        self.last_updated = datetime.now()
+        cache_data = {
+            "encodings_matrix": np.array(all_encodings),
+            "names_map": names_map,
+            "faces_count": len(faces)
+        }
         
-        logger.info(f"Cache loaded: {len(faces)} people, {len(all_encodings)} encodings")
+        logger.info(f"[NO_CACHE] Loaded: {cache_data['faces_count']} people, {len(cache_data['names_map'])} encodings")
+        return cache_data
+    
+    def get_cache_data(self) -> Optional[dict]:
+        return None  # Always return None to force fresh load
     
     def invalidate(self):
-        """Hapus cache (panggil setelah register/update)"""
-        self.faces = None
-        self.encodings_matrix = None
-        self.names_map = None
-        self.last_updated = None
-        logger.info("Cache invalidated")
-    
-    def is_valid(self) -> bool:
-        return self.encodings_matrix is not None
+        logger.info("[NO_CACHE] Nothing to invalidate")
     
     def get_stats(self) -> dict:
-        if not self.is_valid():
-            return {"cached": False}
-        return {
-            "cached": True,
-            "total_people": len(set(self.names_map)) if self.names_map else 0,
-            "total_encodings": len(self.names_map) if self.names_map else 0,
-            "last_updated": self.last_updated.isoformat() if self.last_updated else None
-        }
+        return {"strategy": "disabled", "cached": False}
 
-face_cache = FaceCache()
+
+def create_cache() -> BaseFaceCache:
+    if CACHE_STRATEGY.lower() == 'redis':
+        return RedisFaceCache(REDIS_URL)
+    elif CACHE_STRATEGY.lower() == 'memory':
+        return InMemoryFaceCache()
+    elif CACHE_STRATEGY.lower() == 'disabled':
+        return NoCache()
+    else:
+        logger.warning(f"Unknown cache strategy '{CACHE_STRATEGY}', defaulting to memory")
+        return InMemoryFaceCache()
+
+# Global cache instance
+face_cache = create_cache()
+logger.info(f"Cache strategy initialized: {CACHE_STRATEGY.upper()}")
 
 @app.get("/health")
 async def health(db: Session = Depends(get_db)):
@@ -137,18 +350,26 @@ async def recognize_face(image: UploadFile = File(...), db: Session = Depends(ge
         logger.error(f"Face not detected in uploaded image: {image.filename}")
         raise HTTPException(status_code=400, detail="No face detected in the uploaded image")
     
-    if not face_cache.is_valid():
-        face_cache.load_from_db(db)
+    # Get cache data from the selected cache strategy
+    cache_data = face_cache.get_cache_data()
     
-    if face_cache.encodings_matrix is None or len(face_cache.names_map) == 0:
+    # Load from DB if cache is empty
+    if cache_data is None:
+        cache_data = face_cache.load_from_db(db)
+    
+    # Check if there are any registered faces
+    if cache_data["encodings_matrix"] is None or len(cache_data["names_map"]) == 0:
         logger.warning("No registered faces in the system")
         return {"message": "No registered faces in the system."}
     
-    distances = np.linalg.norm(face_cache.encodings_matrix - encoding, axis=1)
+    # VECTORIZED NUMPY OPERATION
+    # Calculate distances to all encodings at once (1 operation, not 2500 loops)
+    distances = np.linalg.norm(cache_data["encodings_matrix"] - encoding, axis=1)
     
+    # Find the smallest distance
     min_index = np.argmin(distances)
     best_match_distance = float(distances[min_index])
-    best_match_name = face_cache.names_map[min_index]
+    best_match_name = cache_data["names_map"][min_index]
     
     if best_match_distance < FACE_MATCH_THRESHOLD:
         logger.info(f"Face recognized as {best_match_name} with distance {best_match_distance}")

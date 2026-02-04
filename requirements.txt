@@ -10,3 +10,4 @@ uuid==1.30
 python-dotenv==1.0.1
 python-multipart==0.0.20
 setuptools==76.0.0
+redis==7.0.1
