@@ -1,8 +1,9 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from database import get_db, FaceEntity, engine
-from utils import get_face_encoding
+from database import get_db, FaceEntity
+from utils import get_face_encoding, init_face_model, normalize_embedding
 import numpy as np
 import json
 import logging
@@ -23,11 +24,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-FACE_MATCH_THRESHOLD = float(os.getenv('FACE_MATCH_THRESHOLD', '0.6'))
+FACE_MATCH_THRESHOLD = float(os.getenv('FACE_MATCH_THRESHOLD', '0.35'))
 CACHE_STRATEGY = os.getenv('CACHE_STRATEGY', 'memory')  # 'redis', 'memory', 'disabled'
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 
-app = FastAPI(title="Face Recognition API", version="1.0.0")
+# Insightface Configuration
+INSIGHTFACE_MODEL_NAME = os.getenv('INSIGHTFACE_MODEL_NAME', 'buffalo_l')
+INSIGHTFACE_DET_SIZE = int(os.getenv('INSIGHTFACE_DET_SIZE', '640'))
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_face_model(model_name=INSIGHTFACE_MODEL_NAME, det_size=INSIGHTFACE_DET_SIZE)
+    yield
+
+app = FastAPI(title="Face Recognition API", version="1.0.0", lifespan=lifespan)
 
 class BaseFaceCache(ABC):
     @abstractmethod
@@ -362,18 +372,23 @@ async def recognize_face(image: UploadFile = File(...), db: Session = Depends(ge
         logger.warning("No registered faces in the system")
         return {"message": "No registered faces in the system."}
     
-    # VECTORIZED NUMPY OPERATION
-    # Calculate distances to all encodings at once (1 operation, not 2500 loops)
-    distances = np.linalg.norm(cache_data["encodings_matrix"] - encoding, axis=1)
+    # VECTORIZED NUMPY OPERATION — Cosine similarity
+    # Normalize query
+    encoding = normalize_embedding(encoding)
+    # Normalize matrix rows (handles unnormalized old data safely)
+    matrix = cache_data["encodings_matrix"]
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms < 1e-10] = 1
+    matrix = matrix / norms
+
+    scores = np.dot(matrix, encoding)
+    max_index = np.argmax(scores)
+    best_score = float(scores[max_index])
+    best_match_name = cache_data["names_map"][max_index]
     
-    # Find the smallest distance
-    min_index = np.argmin(distances)
-    best_match_distance = float(distances[min_index])
-    best_match_name = cache_data["names_map"][min_index]
-    
-    if best_match_distance < FACE_MATCH_THRESHOLD:
-        logger.info(f"Face recognized as {best_match_name} with distance {best_match_distance}")
-        return {"message": "Face recognized", "match": best_match_name, "distance": best_match_distance}
+    if best_score > FACE_MATCH_THRESHOLD:
+        logger.info(f"Face recognized as {best_match_name} with similarity {best_score:.4f}")
+        return {"message": "Face recognized", "match": best_match_name, "similarity": best_score}
     else:
-        logger.info(f"No match found. Best distance was {best_match_distance}")
+        logger.info(f"No match found. Best similarity was {best_score:.4f}")
         return {"message": "No match found!"}

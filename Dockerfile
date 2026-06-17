@@ -2,31 +2,38 @@ FROM python:3.13.2-slim AS builder
 
 WORKDIR /app
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y cmake build-essential git
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# Copy and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy dependency file and install
+COPY pyproject.toml .
+RUN uv sync --no-dev --system
 
-# Runtime stage  
+# Pre-download insightface model (default: buffalo_l)
+RUN python -c "from insightface.app import FaceAnalysis; app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider']); app.prepare(ctx_id=-1)"
+
+# Runtime stage
 FROM python:3.13.2-slim AS python-runtime
 
 WORKDIR /app
 
-# Install runtime dependencies including curl for health checks
+# Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     libpng16-16 \
     libjpeg62-turbo \
     libwebp-dev \
     libgl1 \
     libglib2.0-0 \
+    libgomp1 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder
 COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy pre-downloaded insightface model
+COPY --from=builder /root/.insightface /root/.insightface
 
 # Copy application code
 COPY . .
