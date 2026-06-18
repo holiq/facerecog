@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Response
+from fastapi import FastAPI, File, UploadFile as UF, Form, HTTPException, Depends, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from database import get_db, FaceEntity
@@ -37,7 +37,12 @@ async def lifespan(app: FastAPI):
     init_face_model(model_name=INSIGHTFACE_MODEL_NAME, det_size=INSIGHTFACE_DET_SIZE)
     yield
 
-app = FastAPI(title="Face Recognition API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Face Recognition API", version="2.0.0", lifespan=lifespan)
+
+# TODO: will be remove when fix issue upload file schema OAS 3.0 released, ref: https://github.com/fastapi/fastapi/pull/15069
+from typing import Annotated
+from pydantic import WithJsonSchema
+UploadFile = Annotated[UF, WithJsonSchema({"type": "string", "format": "binary"})]
 
 class BaseFaceCache(ABC):
     @abstractmethod
