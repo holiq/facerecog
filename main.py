@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, UploadFile as UF, Form, HTTPException, Depends, Response
+from fastapi import FastAPI, File, UploadFile as UF, Form, HTTPException, Depends, Response, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from database import get_db, FaceEntity
@@ -23,10 +24,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def get_float_env(name: str, default: float) -> float:
+    value = os.getenv(name, str(default))
+    try:
+        parsed_value = float(value)
+    except ValueError:
+        logger.warning(f"Invalid {name} value '{value}', using {default}")
+        return default
+
+    if parsed_value <= 0:
+        logger.warning(f"Invalid {name} value '{value}', using {default}")
+        return default
+
+    return parsed_value
+
+
+def get_int_env(name: str, default: int) -> int:
+    value = os.getenv(name, str(default))
+    try:
+        parsed_value = int(value)
+    except ValueError:
+        logger.warning(f"Invalid {name} value '{value}', using {default}")
+        return default
+
+    if parsed_value < 1:
+        logger.warning(f"Invalid {name} value '{value}', using {default}")
+        return default
+
+    return parsed_value
+
+
 # Configuration
-FACE_MATCH_THRESHOLD = float(os.getenv('FACE_MATCH_THRESHOLD', '0.35'))
+FACE_MATCH_THRESHOLD = get_float_env('FACE_MATCH_THRESHOLD', 0.35)
 CACHE_STRATEGY = os.getenv('CACHE_STRATEGY', 'memory')  # 'redis', 'memory', 'disabled'
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
+WORKERS = get_int_env('WORKERS', 1)
+FACE_MAX_REQUEST_SIZE_MB = get_float_env('FACE_MAX_REQUEST_SIZE_MB', 10)
+FACE_MAX_REQUEST_SIZE_BYTES = int(FACE_MAX_REQUEST_SIZE_MB * 1024 * 1024)
 
 # Insightface Configuration
 INSIGHTFACE_MODEL_NAME = os.getenv('INSIGHTFACE_MODEL_NAME', 'buffalo_l')
@@ -38,6 +72,34 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="Face Recognition API", version="2.0.0", lifespan=lifespan)
+UPLOAD_LIMITED_PATHS = {"/face-recognition/register", "/face-recognition/predict"}
+
+
+@app.middleware("http")
+async def limit_upload_request_size(request: Request, call_next):
+    if request.method == "POST" and request.url.path in UPLOAD_LIMITED_PATHS:
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                request_size = int(content_length)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Invalid Content-Length header."},
+                )
+
+            if request_size > FACE_MAX_REQUEST_SIZE_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": (
+                            f"Request body is too large. Maximum is "
+                            f"{FACE_MAX_REQUEST_SIZE_MB:g} MB."
+                        )
+                    },
+                )
+
+    return await call_next(request)
 
 # TODO: will be remove when fix issue upload file schema OAS 3.0 released, ref: https://github.com/fastapi/fastapi/pull/15069
 from typing import Annotated
@@ -310,6 +372,12 @@ def create_cache() -> BaseFaceCache:
 face_cache = create_cache()
 logger.info(f"Cache strategy initialized: {CACHE_STRATEGY.upper()}")
 
+if CACHE_STRATEGY.lower() == 'memory' and WORKERS > 1:
+    logger.warning(
+        "WORKERS is greater than 1 while CACHE_STRATEGY=memory. "
+        "Use CACHE_STRATEGY=redis so all workers share cache state."
+    )
+
 @app.get("/health")
 async def health(db: Session = Depends(get_db)):
     try:
@@ -336,8 +404,11 @@ async def register_faces(images: list[UploadFile] = File(...), name: str = Form(
             descriptors.append(encoding.tolist())
             logger.info(f"Face encoding extracted from {image.filename}")
         except HTTPException as e:
-            logger.error(f"Face not detected in {image.filename}")
-            raise HTTPException(status_code=400, detail=f"Face not detected in {image.filename}")
+            logger.error(f"Face encoding failed for {image.filename}: {e.detail}")
+            raise HTTPException(
+                status_code=e.status_code,
+                detail=f"{image.filename}: {e.detail}"
+            )
 
     existing_face = db.query(FaceEntity).filter(FaceEntity.name == name).first()
 
@@ -362,8 +433,8 @@ async def recognize_face(image: UploadFile = File(...), db: Session = Depends(ge
     try:
         encoding = get_face_encoding(image)
     except HTTPException as e:
-        logger.error(f"Face not detected in uploaded image: {image.filename}")
-        raise HTTPException(status_code=400, detail="No face detected in the uploaded image")
+        logger.error(f"Face encoding failed for uploaded image {image.filename}: {e.detail}")
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
     
     # Get cache data from the selected cache strategy
     cache_data = face_cache.get_cache_data()

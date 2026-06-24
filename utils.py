@@ -13,11 +13,38 @@ logger = logging.getLogger(__name__)
 
 _face_app = None
 
+
+def get_positive_float_env(name: str, default: float) -> float:
+    value = os.getenv(name, str(default))
+    try:
+        parsed_value = float(value)
+    except ValueError:
+        logger.warning(f"Invalid {name} value '{value}', using {default}")
+        return default
+
+    if parsed_value <= 0:
+        logger.warning(f"Invalid {name} value '{value}', using {default}")
+        return default
+
+    return parsed_value
+
+
 FACE_MIN_IMAGE_SIZE = int(os.getenv('FACE_MIN_IMAGE_SIZE', '100'))
 FACE_BLUR_THRESHOLD = float(os.getenv('FACE_BLUR_THRESHOLD', '50'))
 FACE_BRIGHTNESS_MIN = float(os.getenv('FACE_BRIGHTNESS_MIN', '40'))
 FACE_BRIGHTNESS_MAX = float(os.getenv('FACE_BRIGHTNESS_MAX', '210'))
 FACE_MAX_IMAGE_SIZE = int(os.getenv('FACE_MAX_IMAGE_SIZE', '2048'))
+FACE_MAX_UPLOAD_SIZE_MB = get_positive_float_env('FACE_MAX_UPLOAD_SIZE_MB', 2)
+FACE_MAX_UPLOAD_SIZE_BYTES = int(FACE_MAX_UPLOAD_SIZE_MB * 1024 * 1024)
+DEFAULT_ALLOWED_IMAGE_TYPES = {'image/jpeg', 'image/jpg', 'image/png', 'image/webp'}
+FACE_ALLOWED_IMAGE_TYPES = {
+    content_type.strip().lower()
+    for content_type in os.getenv(
+        'FACE_ALLOWED_IMAGE_TYPES',
+        'image/jpeg,image/jpg,image/png,image/webp'
+    ).split(',')
+    if content_type.strip()
+} or DEFAULT_ALLOWED_IMAGE_TYPES
 
 
 def init_face_model(model_name: str = "buffalo_l", det_size: int = 640):
@@ -36,9 +63,7 @@ def get_face_encoding(image: UploadFile):
     if _face_app is None:
         raise RuntimeError("Face model not initialized. Call init_face_model() first.")
 
-    image.file.seek(0)
-    image_bytes = image.file.read()
-    image.file.seek(0)
+    image_bytes = _read_upload_bytes(image)
 
     image_rgb = _load_image(image_bytes)
     _validate_quality(image_rgb)
@@ -59,6 +84,39 @@ def normalize_embedding(embedding: np.ndarray) -> np.ndarray:
     if norm < 1e-10:
         raise HTTPException(status_code=400, detail="Invalid embedding returned by model.")
     return embedding / norm
+
+
+def _read_upload_bytes(image: UploadFile) -> bytes:
+    _validate_upload_content_type(image)
+
+    image.file.seek(0)
+    image_bytes = image.file.read(FACE_MAX_UPLOAD_SIZE_BYTES + 1)
+    image.file.seek(0)
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Image payload is empty.")
+
+    if len(image_bytes) > FACE_MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image is too large, maximum is {FACE_MAX_UPLOAD_SIZE_MB:g} MB.",
+        )
+
+    return image_bytes
+
+
+def _validate_upload_content_type(image: UploadFile):
+    content_type = (image.content_type or "").split(";")[0].strip().lower()
+
+    if not content_type:
+        raise HTTPException(status_code=415, detail="Image content type is required.")
+
+    if content_type not in FACE_ALLOWED_IMAGE_TYPES:
+        allowed_types = ", ".join(sorted(FACE_ALLOWED_IMAGE_TYPES))
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported image content type '{content_type}'. Allowed: {allowed_types}.",
+        )
 
 
 def _load_image(image_bytes: bytes) -> np.ndarray:
